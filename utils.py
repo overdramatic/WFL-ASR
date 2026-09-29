@@ -105,6 +105,98 @@ def merge_adjacent_segments(segs, mode="right"):
     return merged
 
 
+def segment_boundaries(segments, tolerance=0.001):
+    """Transition times of a segment list: every start, plus the final end.
+
+    Adjacent segments share a time (end == next start), so those duplicates are
+    collapsed; counting them twice would inflate every boundary score. 1 ms is
+    far below the 20 ms frame grid, so nothing meaningful is lost.
+    """
+    if not segments:
+        return []
+    ordered = sorted(segments, key=lambda seg: seg[0])
+    times = [float(s) for s, _, _ in ordered]
+    times.append(float(ordered[-1][1]))
+    unique = []
+    for t in times:
+        if not unique or t - unique[-1] > tolerance:
+            unique.append(t)
+    return unique
+
+
+def match_boundaries(reference, hypothesis, tolerance):
+    """Monotone 1-1 matching of two ascending boundary lists.
+
+    Returns the matched (reference, hypothesis) pairs. Both lists must already
+    be sorted -- a sweep with a moving pointer is optimal for sorted input and
+    keeps the pairing monotonic, so two predictions can never claim the same
+    reference boundary.
+    """
+    pairs = []
+    h = 0
+    for r in reference:
+        while h < len(hypothesis) and hypothesis[h] < r - tolerance:
+            h += 1
+        if h < len(hypothesis) and abs(hypothesis[h] - r) <= tolerance:
+            pairs.append((r, hypothesis[h]))
+            h += 1
+    return pairs
+
+
+def collapse_repeated(phones):
+    """Drop consecutive duplicates.
+
+    A labeller that chops one AA into A|A must not be punished for it: the
+    evaluation works on phoneme sequences, not on tag transitions.
+    """
+    collapsed = []
+    for phone in phones:
+        if not collapsed or phone != collapsed[-1]:
+            collapsed.append(phone)
+    return collapsed
+
+
+def phone_error_rate(reference, prediction):
+    """Levenshtein distance between two phone sequences and the reference length."""
+    row = list(range(len(prediction) + 1))
+    for i, ref in enumerate(reference, 1):
+        next_row = [i]
+        for j, pred in enumerate(prediction, 1):
+            next_row.append(min(
+                row[j] + 1,
+                next_row[j - 1] + 1,
+                row[j - 1] + (ref != pred),
+            ))
+        row = next_row
+    return row[-1], len(reference)
+
+
+def boundary_counts(ref_segments, hyp_segments, tolerances_ms):
+    """Raw boundary counts for one file, ready to be summed over a set.
+
+    PER collapses repeated phonemes and discards all timing, so on its own it
+    cannot tell a model that places boundaries well from one that does not.
+    These counts back the F-score and the mean error of the boundary positions,
+    which is what actually decides the output .lab for a labeller.
+
+    Returns (matches, abs_err, matched_n, n_ref, n_hyp) where `matches` maps
+    each tolerance in ms to the number of matched boundaries. Callers
+    micro-average by summing, then divide.
+    """
+    ref_bnd = segment_boundaries(ref_segments)
+    hyp_bnd = segment_boundaries(hyp_segments)
+    matches = {}
+    abs_err, matched_n = 0.0, 0
+    if tolerances_ms:
+        for tol_ms in tolerances_ms:
+            pairs = match_boundaries(ref_bnd, hyp_bnd, tol_ms / 1000.0)
+            matches[tol_ms] = len(pairs)
+            if tol_ms == max(tolerances_ms):
+                abs_err = sum(abs(r - h) for r, h in pairs)
+                matched_n = len(pairs)
+    return matches, abs_err, matched_n, len(ref_bnd), len(hyp_bnd)
+
+
 def _to_numpy_2d(x):
     if hasattr(x, "detach"):
         x = x.detach()

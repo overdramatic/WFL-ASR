@@ -7,9 +7,14 @@ import soundfile as sf
 import torch
 import torchaudio
 import yaml
-from librosa.sequence import _viterbi
-from numba import bool, float64, njit, uint16
 
+from decode import (
+    apply_hard_silence,
+    constrained_decode,
+    continuous_segments,
+    forced_align_viterbi,
+    viterbi_decode,
+)
 from model import BIOPhonemeTagger
 from utils import (
     canonical_to_lang,
@@ -47,281 +52,22 @@ def find_matching_txt(wav_path):
     return txt_path if os.path.isfile(txt_path) else None
 
 
-def bio_inputs(logits, id2label):
-    labels = [id2label[i] for i in range(len(id2label))]
-    scores = logits.detach().double().cpu().numpy()
 
-    if scores.ndim != 2 or scores.shape[1] != len(labels):
-        raise ValueError("Expected logits shaped (frames, labels).")
-    if not np.isfinite(scores).all():
-        raise ValueError("Decoder received non-finite logits.")
-    if any(
-        tag != "O" and not (tag.startswith(("B-", "I-")) and len(tag) > 2)
-        for tag in labels
-    ):
-        raise ValueError("Expected O and valid B-/I- labels.")
-
-    keep = [i for i, tag in enumerate(labels) if tag != "O"]
-    scores = scores[:, keep]
-    labels = [labels[i] for i in keep]
-
-    starts = np.array([tag.startswith("B-") for tag in labels], dtype=np.bool)
-    if not starts.any():
-        raise ValueError("Decoder requires at least one B- label.")
-
-    allowed = np.array(
-        [
-            [
-                nxt.startswith("B-")
-                or (nxt.startswith("I-") and prev in (f"B-{nxt[2:]}", nxt))
-                for nxt in labels
-            ]
-            for prev in labels
-        ],
-        dtype=np.bool,
-    )
-
-    return scores, labels, allowed, starts
-
-
-def constrained_decode(logits, id2label):
-    scores, labels, allowed, valid = bio_inputs(logits, id2label)
-    preds = []
-    for frame in scores:
-        best = int(np.argmax(np.where(valid, frame, -np.inf)))
-        preds.append(labels[best])
-        valid = allowed[best]
-    return preds
-
-
-def viterbi_decode(logits, id2label, viterbi_bias=1):
-    if not np.isfinite(viterbi_bias) or viterbi_bias < 1:
-        raise ValueError("viterbi_bias must be finite and at least 1.")
-
-    scores, labels, allowed, starts = bio_inputs(logits, id2label)
-    if scores.shape[0] == 0:
-        return []
-
-    log_probs = scores - np.logaddexp.reduce(scores, axis=1, keepdims=True)
-
-    transitions = np.where(allowed, 0.0, -np.inf)
-    for j, tag in enumerate(labels):
-        if tag.startswith("I-"):
-            transitions[allowed[:, j], j] = np.log(viterbi_bias)
-
-    initial = np.where(starts, -np.log(starts.sum()), -np.inf)
-    path, _ = _viterbi(log_probs, transitions, initial)
-
-    return [labels[int(i)] for i in path]
-
-
-@njit(
-    uint16[:](float64[:, :], uint16[:], bool[:], uint16[:], float64, float64, float64)
-)
-def _forced_align_viterbi(
-    log_probs,
-    target_seq,
-    begin_mask,
-    optional_mask,
-    self_loop_penalty,
-    forward_penalty,
-    skip_penalty,
-):
-    K = len(target_seq)
-    _, T = log_probs.shape
-    scores = np.full((K, T), -np.inf)
-    pointers = np.zeros((K, T), dtype=np.uint16)
-
-    scores[0, 0] = log_probs[target_seq[0], 0]
-
-    for t in range(1, T):
-        for s in range(K):
-            state_idx = target_seq[s]
-
-            curr_states = np.zeros(3, dtype=np.uint16)
-            curr_scores = np.zeros(3, dtype=np.float64)
-            count = 0
-            if begin_mask[s]:
-                curr_states[count] = s
-                curr_scores[count] = -np.inf
-            else:
-                curr_states[count] = s
-                curr_scores[count] = scores[s, t - 1] + self_loop_penalty
-            count += 1
-
-            if s > 0:
-                curr_states[count] = s - 1
-                curr_scores[count] = scores[s - 1, t - 1] + forward_penalty
-                count += 1
-
-            if s > 1 and optional_mask[s - 1] > 0:
-                curr_states[count] = s - optional_mask[s - 1] - 1
-                curr_scores[count] = (
-                    scores[s - optional_mask[s - 1] - 1, t - 1] + skip_penalty
-                )
-                count += 1
-
-            curr_states = curr_states[:count]
-            curr_scores = curr_scores[:count]
-            best_state_idx = np.argmax(curr_scores)
-
-            scores[s, t] = curr_scores[best_state_idx] + log_probs[state_idx, t]
-            pointers[s, t] = curr_states[best_state_idx]
-
-    path = np.zeros(T, dtype=np.uint16)
-    path[-1] = (
-        K - 2 if optional_mask[-1] > 0 and scores[-2, -1] > scores[-1, -1] else K - 1
-    )
-
-    for t in range(T - 2, -1, -1):
-        path[t] = pointers[path[t + 1], t + 1]
-
-    return path
-
-
-def forced_align_viterbi(
-    logits,
-    id2label,
-    phones,
-    self_loop_penalty=-4.6,
-    forward_penalty=-0.6,
-    skip_penalty=-2.3,
-):
-    label2id = {label: id for id, label in id2label.items()}
-    # turn to log probs
-    log_probs = (
-        torch.log_softmax(logits, dim=-1).detach().double().cpu().numpy().transpose()
-    )
-
-    # make target sequence
-    target_seq = []
-    begin_mask = []
-    for phn in phones:
-        target_seq.extend([f"B-{phn}", f"I-{phn}"])
-        begin_mask.extend([True, False])
-    target_seq_idx = np.array([label2id[phn] for phn in target_seq], dtype=np.uint16)
-    begin_mask = np.array(begin_mask, dtype=np.bool)
-    optional_mask = []
-    for phn in target_seq:
-        if phn.startswith("I-"):
-            if len(optional_mask) > 0:
-                optional_mask.append(optional_mask[-1] + 1)
-            else:
-                optional_mask.append(1)
-        else:
-            optional_mask.append(0)
-    optional_mask = np.array(optional_mask, dtype=np.uint16)
-
-    path = _forced_align_viterbi(
-        log_probs,
-        target_seq_idx,
-        begin_mask,
-        optional_mask,
-        self_loop_penalty,
-        forward_penalty,
-        skip_penalty,
-    )
-
-    return [target_seq[p] for p in path]
-
-
-def apply_hard_silence(segments, audio, sr, threshold, min_duration, silence_phoneme):
-    if len(audio) == 0:
-        return segments
-
-    frame_length = int(sr * 0.01)
-    if frame_length < 1:
-        frame_length = 1
-
-    pad_len = (frame_length - (len(audio) % frame_length)) % frame_length
-    padded_audio = np.pad(np.abs(audio), (0, pad_len), mode="constant")
-
-    frames = padded_audio.reshape(-1, frame_length)
-    frame_max = np.max(frames, axis=1)
-
-    is_silent_frame = frame_max < threshold
-
-    silence_intervals = []
-    in_silence = False
-    start_frame = 0
-
-    for i, silent in enumerate(is_silent_frame):
-        if silent and not in_silence:
-            in_silence = True
-            start_frame = i
-        elif not silent and in_silence:
-            in_silence = False
-            duration = (i - start_frame) * 0.01
-            if duration >= min_duration:
-                silence_intervals.append((start_frame * 0.01, i * 0.01))
-
-    if in_silence:
-        duration = (len(is_silent_frame) - start_frame) * 0.01
-        if duration >= min_duration:
-            silence_intervals.append((start_frame * 0.01, len(is_silent_frame) * 0.01))
-
-    if not silence_intervals:
-        return segments
-
-    temp_segments = segments.copy()
-
-    for sil_start, sil_end in silence_intervals:
-        next_temp_segments = []
-        for s_start, s_end, s_label in temp_segments:
-            if s_end <= sil_start or s_start >= sil_end:
-                next_temp_segments.append((s_start, s_end, s_label))
-                continue
-
-            if s_start < sil_start:
-                next_temp_segments.append((s_start, sil_start, s_label))
-            if s_end > sil_end:
-                next_temp_segments.append((sil_end, s_end, s_label))
-
-        temp_segments = next_temp_segments
-
-    for s, e in silence_intervals:
-        temp_segments.append((s, e, silence_phoneme))
-
-    temp_segments.sort(key=lambda x: x[0])
-    return temp_segments
-
-
-def continuous_segments(segments, duration):
-    if duration <= 0:
-        return []
-    starts = []
-    for s, _, ph in sorted(segments, key=lambda seg: seg[0]):
-        s = float(s)
-        s = max(0.0, s)
-        if s >= duration or (starts and s <= starts[-1][0]):
-            continue
-        starts.append((s, ph))
-
-    if not starts:
-        return []
-    starts[0] = (0.0, starts[0][1])
-    return [
-        (s, starts[i + 1][0] if i + 1 < len(starts) else duration, ph)
-        for i, (s, ph) in enumerate(starts)
-    ]
-
-
-def process_audio(
+def encode_audio(
     model,
     audio,
     sr,
     config,
     device,
     lang_id=None,
-    merge_map=None,
-    lang_name=None,
-    phones=None,
     no_use_offset=False,
-    decoder="constrained",
-    viterbi_bias=5,
 ):
-    if len(audio) == 0:
-        return []
+    """Run the tagger over a whole file. Returns (logits, offsets, duration).
+
+    Split out of process_audio so tools that score the DECODER (see
+    tune_decode.py) can pay for the forward pass once and then sweep decode
+    parameters without touching the model again.
+    """
     original_duration = len(audio) / sr
 
     audio = audio / (np.max(np.abs(audio)) + 1e-8)
@@ -366,6 +112,30 @@ def process_audio(
     full_offsets = None
     if accumulated_offsets and not no_use_offset:
         full_offsets = torch.cat(accumulated_offsets, dim=0)
+
+    return full_logits, full_offsets, original_duration
+
+
+def process_audio(
+    model,
+    audio,
+    sr,
+    config,
+    device,
+    lang_id=None,
+    merge_map=None,
+    lang_name=None,
+    phones=None,
+    no_use_offset=False,
+    decoder="constrained",
+    viterbi_bias=5,
+):
+    if len(audio) == 0:
+        return []
+
+    full_logits, full_offsets, original_duration = encode_audio(
+        model, audio, sr, config, device, lang_id, no_use_offset
+    )
 
     if phones:
         if decoder == "constrained":

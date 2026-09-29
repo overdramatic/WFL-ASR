@@ -19,9 +19,16 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from torch.utils.data import Dataset, DataLoader, Subset, random_split
 from model import BIOPhonemeTagger, FocalLoss
-from utils import decode_bio_tags, visualize_prediction, load_phoneme_list
+from utils import (
+    boundary_counts,
+    collapse_repeated,
+    decode_bio_tags,
+    load_phoneme_list,
+    phone_error_rate,
+    visualize_prediction,
+)
 import pytorch_optimizer as optim
-from infer import viterbi_decode, continuous_segments
+from decode import continuous_segments, viterbi_decode
 
 
 def collate_fn(batch):
@@ -200,6 +207,15 @@ class WFLDataModule(pl.LightningDataModule):
             val_dataset, [indices[p] for p in split["val_paths"]]
         )
 
+        if not any(
+            train_dataset.samples[i]["phoneme_segments"] for i in self.val_ds.indices
+        ):
+            raise ValueError(
+                "The validation split contains no labelled phoneme, so val/per "
+                "cannot be computed and ModelCheckpoint has nothing to monitor. "
+                "Fix data_split.json or data.num_val_files."
+            )
+
         is_whisper = self.config["model"].get("encoder_type", "whisper").lower() == "whisper"
         use_cached_mel = is_whisper and self.config["model"].get("precompute_features", True)
         if use_cached_mel:
@@ -241,9 +257,23 @@ class WFLModel(pl.LightningModule):
         self.criterion = FocalLoss(alpha=0.5, gamma=2.0, ignore_index=-100)
         self.offset_weight = config["model"].get("subframe_loss_weight", 5.0)
         self.frame_duration = config["data"].get("frame_duration", 0.02)
-        
+
+        # Decode exactly like inference does, so validation measures the
+        # decoder that will actually run. viterbi_bias lives under postprocess
+        # next to the other decode knobs; the old validation.viterbi_bias is
+        # still honoured.
+        self.viterbi_bias = config.get("postprocess", {}).get(
+            "viterbi_bias", config.get("validation", {}).get("viterbi_bias", 5)
+        )
+        # Boundary accuracy in ms is the metric that matters for a labeller:
+        # PER collapses repeated phonemes and throws all timing away.
+        self.boundary_tolerances_ms = sorted(
+            config.get("validation", {}).get("boundary_tolerance_ms", [20, 40])
+        )
+        self.primary_tolerance_ms = self.boundary_tolerances_ms[-1]
+
         total_val = config["data"]["num_val_files"]
-        self.num_vis_samples = min(total_val, 8) 
+        self.num_vis_samples = min(total_val, 8)
 
     def forward(self, x, lang_ids, lengths):
         return self.model(x, lang_ids, lengths=lengths)
@@ -308,28 +338,6 @@ class WFLModel(pl.LightningModule):
     def on_validation_epoch_start(self):
         self.val_vis_count = 0
 
-    @staticmethod
-    def _collapse_phones(phones):
-        collapsed = []
-        for phone in phones:
-            if not collapsed or phone != collapsed[-1]:
-                collapsed.append(phone)
-        return collapsed
-        
-    @staticmethod
-    def _edit_distance(reference, prediction):
-        row = list(range(len(prediction) + 1))
-        for i, ref in enumerate(reference, 1):
-            next_row = [i]
-            for j, pred in enumerate(prediction, 1):
-                next_row.append(min(
-                    row[j] + 1,
-                    next_row[j - 1] + 1,
-                    row[j - 1] + (ref != pred),
-                ))
-            row = next_row
-        return row[-1]
-
     def validation_step(self, batch, batch_idx):
         inputs, labels, wavs, segs_gt, _, langs, lengths = batch
         logits, offsets = self(inputs, langs, lengths)
@@ -339,10 +347,20 @@ class WFLModel(pl.LightningModule):
 
         valid = labels != -100
         frame_count = int(valid.sum().item())
+        total_frames = int(lengths.sum().item())
         if frame_count:
             acc = (logits.argmax(-1)[valid] == labels[valid]).float().mean() * 100
             self.log("val/acc", acc, on_step=False, on_epoch=True,
                      prog_bar=True, batch_size=frame_count)
+        if total_frames:
+            # Share of the validation audio with no label at all. The .lab files
+            # are expected to cover every frame, so anything above zero means
+            # the reported numbers come from a filtered subset.
+            self.log(
+                "val/unlabelled_pct",
+                100.0 * (total_frames - frame_count) / total_frames,
+                on_step=False, on_epoch=True, batch_size=inputs.size(0),
+            )
         for name, value in (
             ("loss", loss), ("cls_loss", cls_loss), ("off_loss", off_loss)
         ):
@@ -350,27 +368,56 @@ class WFLModel(pl.LightningModule):
                      prog_bar=name == "loss", batch_size=inputs.size(0))
 
         errors, phone_count = 0, 0
+        files_scored, files_empty = 0, 0
+        ref_bnd_n, hyp_bnd_n = 0, 0
+        matched = {tol: 0 for tol in self.boundary_tolerances_ms}
+        abs_err, abs_err_n = 0.0, 0
+
         for i, wav in enumerate(wavs):
             length = int(lengths[i].item())
+            duration = len(wav) / 16000
             tags = viterbi_decode(
-                logits[i, :length], self.id2label,
-                viterbi_bias=self.config.get("validation", {}).get("viterbi_bias", 5),
+                logits[i, :length], self.id2label, viterbi_bias=self.viterbi_bias
             )
             pred_segments = continuous_segments(
                 decode_bio_tags(
                     tags, self.frame_duration, offsets[i, :length].detach().cpu()
                 ),
-                len(wav) / 16000,
+                duration,
             )
-            reference = self._collapse_phones(
-                [ph for _, _, ph in segs_gt[i]]
+            # Normalise the reference the same way inference normalises its
+            # output, otherwise the leading unlabelled frames show up as a
+            # boundary error that no model can fix.
+            gt_segments = continuous_segments(segs_gt[i], duration)
+
+            reference = collapse_repeated(
+                [ph for _, _, ph in gt_segments]
             )
-            prediction = self._collapse_phones(
+            prediction = collapse_repeated(
                 [ph for _, _, ph in pred_segments]
             )
-            if (labels[i, :length] != -100).all().item():
-                errors += self._edit_distance(reference, prediction)
-                phone_count += len(reference)
+
+            # Every file with reference phonemes counts. The previous gate
+            # required a file with ZERO unlabelled frames, which silently
+            # dropped any file whose tail was not annotated -- HTK .lab files
+            # routinely end a few ms before the audio does.
+            if reference:
+                files_scored += 1
+                errors_i, ref_n = phone_error_rate(reference, prediction)
+                errors += errors_i
+                phone_count += ref_n
+            else:
+                files_empty += 1
+
+            matches, err_sum, err_n, n_ref, n_hyp = boundary_counts(
+                gt_segments, pred_segments, self.boundary_tolerances_ms
+            )
+            for tol_ms, count in matches.items():
+                matched[tol_ms] += count
+            abs_err += err_sum
+            abs_err_n += err_n
+            ref_bnd_n += n_ref
+            hyp_bnd_n += n_hyp
 
             if self.val_vis_count < self.num_vis_samples:
                 self._log_visualization(
@@ -378,10 +425,29 @@ class WFLModel(pl.LightningModule):
                 )
                 self.val_vis_count += 1
 
+        if files_scored + files_empty:
+            self.log(
+                "val/per_files_pct",
+                100.0 * files_scored / (files_scored + files_empty),
+                on_step=False, on_epoch=True, batch_size=inputs.size(0),
+            )
         if phone_count:
-            self.log("val/per", logits.new_tensor(100.0 * errors / phone_count),
+            self.log("val/per", 100.0 * errors / phone_count,
                      on_step=False, on_epoch=True, prog_bar=True,
                      batch_size=phone_count)
+        if abs_err_n:
+            self.log("val/boundary_mae_ms", 1000.0 * abs_err / abs_err_n,
+                     on_step=False, on_epoch=True, batch_size=abs_err_n)
+        boundary_denom = ref_bnd_n + hyp_bnd_n
+        if boundary_denom:
+            for tol_ms in self.boundary_tolerances_ms:
+                self.log(
+                    f"val/boundary_f1@{tol_ms}ms",
+                    2.0 * matched[tol_ms] / boundary_denom,
+                    on_step=False, on_epoch=True,
+                    prog_bar=(tol_ms == self.primary_tolerance_ms),
+                    batch_size=boundary_denom,
+                )
         return loss
 
     def on_validation_epoch_end(self):
@@ -391,6 +457,15 @@ class WFLModel(pl.LightningModule):
             f"Loss: {metrics.get('val/loss', 0.0):.4f} | "
             f"Frame accuracy: {metrics.get('val/acc', 0.0):.2f}% | "
             f"PER: {metrics.get('val/per', float('nan')):.2f}%"
+        )
+        f1 = " | ".join(
+            f"F1@{tol}ms {metrics.get(f'val/boundary_f1@{tol}ms', float('nan')) * 100:.1f}%"
+            for tol in self.boundary_tolerances_ms
+        )
+        print(
+            f"  Boundaries: MAE {metrics.get('val/boundary_mae_ms', float('nan')):.1f} ms | {f1}"
+            f" | files scored {metrics.get('val/per_files_pct', 0.0):.0f}%"
+            f" | unlabelled frames {metrics.get('val/unlabelled_pct', 0.0):.2f}%"
         )
 
     def _log_visualization(self, wav, pred_segments, gt_segments, sample_idx=0):
@@ -454,9 +529,9 @@ def main():
 
     checkpoint_callback = ModelCheckpoint(
         dirpath=save_dir,
-        filename="model-ep{epoch:02d}-{val/loss:.4f}",
+        filename="model-ep{epoch:02d}-{val/per:.2f}",
         auto_insert_metric_name=False,
-        monitor="val/loss",
+        monitor="val/per",
         mode="min",
         save_top_k=config["training"]["max_checkpoints"],
         save_last=True,
