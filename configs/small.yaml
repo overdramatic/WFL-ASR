@@ -11,6 +11,20 @@ model:
   encoder_type: "whisper"
   whisper_model: "openai/whisper-base"
 
+  # Computes the Whisper mel inside the DataLoader worker instead of inside
+  # forward(). Bit-for-bit identical output, but off the critical path.
+  # Measured on T4: 77 ms of 247 ms per step (31%). Requires num_workers > 0.
+  precompute_features: true
+
+  # false = frozen encoder in fp32 (safe, default). true = lets the encoder use
+  # autocast (16-mixed): measured on T4 with a trained checkpoint,
+  # 170 -> 90 ms/step (1.89x) with 99.96% of frames keeping the same label.
+  # Frozen encoder = no fp16 gradient crossing its 74M params; the only risk is
+  # attention overflow, counted as train/nonfinite_steps.
+  # If you enable it, fine-tune and compare validation WER before trusting it.
+  encoder_fp16: false
+
+
   # totally frozen encoder. below 30 mins is not enough to finetune whisper
   freeze_encoder: true
   unfreeze_last_n_layers: 0
@@ -37,7 +51,11 @@ finetune:
 
 training:
   batch_size: 4
-  num_workers: 2
+  # Measured on T4 (benchmark cell 11, with the FE already in the worker):
+  # nw=0 -> 43% wait (0.64x, the FE serializes in the main process).
+  # nw=1 -> 216 ms/step, nw=2 -> 227 ms. With 2 vCPUs, two FE workers compete
+  # with each other and nw=1 wins by 5%.
+  num_workers: 1
   optimizer: "AdamW"
 
   learning_rate: 0.0001

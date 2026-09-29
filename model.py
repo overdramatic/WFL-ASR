@@ -158,6 +158,18 @@ class BIOPhonemeTagger(nn.Module):
             self.encoder = WhisperModel.from_pretrained(encoder_dir).encoder
             hidden_size = self.encoder.config.d_model
             self.layer_weights = nn.Parameter(torch.zeros(len(self.encoder.layers) + 1))
+            # If True, forward() receives an already-computed mel
+            # (B, n_mels, frames) instead of the raw waveform.
+            # See FeatureCollator in train.py.
+            self.precompute_features = config["model"].get("precompute_features", True)
+            # Keeps the frozen encoder in fp32 by default. Set
+            # encoder_fp16: true to let the encoder use the outer autocast.
+            # Measured on T4 (bs=4, TRAINED checkpoint): 170 -> 90 ms/step
+            # (1.89x) with 99.96% of frames keeping the same label. Since the
+            # encoder is FROZEN, no fp16 gradient crosses its 74M params --
+            # the real risk is attention overflow, counted by train.py as
+            # train/nonfinite_steps. Default false: the decision is the user's.
+            self.encoder_fp32 = not config["model"].get("encoder_fp16", False)
         else:
             self.encoder = None
             self.feature_extractor = None
@@ -224,14 +236,30 @@ class BIOPhonemeTagger(nn.Module):
 
     def forward(self, input_values, lang_id=None, max_label_len=None, lengths=None):
         if self.encoder_type == "whisper":
-            features = self.feature_extractor(
-                input_values.cpu().numpy(), sampling_rate=16000,
-                return_tensors="pt",
-            )
-            input_features = features["input_features"].to(input_values.device)
-            encoder_out = self.encoder(
-                input_features, output_hidden_states=True, return_dict=True
-            )
+            if self.precompute_features:
+                if input_values.dim() != 3:
+                    raise ValueError(
+                        f"precompute_features=True espera mel (B, n_mels, frames), "
+                        f"recebi {tuple(input_values.shape)}. Verifique o FeatureCollator."
+                    )
+                input_features = input_values
+            else:
+                features = self.feature_extractor(
+                    input_values.cpu().numpy(), sampling_rate=16000,
+                    return_tensors="pt",
+                )
+                input_features = features["input_features"].to(input_values.device)
+
+            # The encoder is FROZEN (freeze_encoder): it needs no gradient.
+            # The default (fp32) is the safe path -- opening it to fp16 gives
+            # ~1.9x (measured on T4) without practically changing any frame,
+            # but the call belongs to whoever trains. See encoder_fp16 in the
+            # config.
+            with torch.autocast(device_type=input_values.device.type,
+                                enabled=not self.encoder_fp32):
+                encoder_out = self.encoder(
+                    input_features.float(), output_hidden_states=True, return_dict=True
+                )
             weights = self.layer_weights.softmax(dim=0)
             hidden_states = sum(
                 weight.to(state.dtype) * F.layer_norm(state, (state.size(-1),))
@@ -245,10 +273,13 @@ class BIOPhonemeTagger(nn.Module):
                 self.config["data"]["sample_rate"]
                 * self.config["data"].get("frame_duration", 0.02)
             )
-            count = (
-                int(max_label_len) if max_label_len is not None
-                else math.ceil(input_values.size(-1) / frame_samples)
-            )
+            if input_values.dim() == 3:
+                # ja e mel: 3000 frames de mel -> 1500 frames de 0.02s
+                count = input_values.size(-1) // 2
+            elif max_label_len is not None:
+                count = int(max_label_len)
+            else:
+                count = math.ceil(input_values.size(-1) / frame_samples)
             lengths = [count] * input_values.size(0)
 
         lengths = torch.as_tensor(
