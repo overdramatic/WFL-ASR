@@ -1,4 +1,6 @@
 import os
+import sys
+import time
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0' 
@@ -29,6 +31,68 @@ from utils import (
 )
 import pytorch_optimizer as optim
 from decode import continuous_segments, viterbi_decode
+
+
+class StatusLine:
+    """One line of training state, rewritten in place instead of appended.
+
+    Lightning's progress bar is what fills a Colab cell with thousands of lines:
+    stdout there is not a terminal, so tqdm gives up on in-place redrawing and
+    emits a fresh line on every refresh, and the bar also carries a ~15-line
+    metrics table per refresh. Over a long run the cell becomes unusable and the
+    number you actually want sits far off-screen.
+
+    This keeps the display to a single physical line: rewrite it in place, and
+    pad with spaces so a shrinking value cannot leave debris from the previous,
+    longer one. Callers should only pass fixed-width fields, otherwise the line
+    jitters as digits change.
+
+    Outside a terminal (redirected to a file, `tee`) the carriage return is
+    meaningless, so `plain` mode writes one line per update instead. That is
+    also what `--plain` forces, for reading the log after the fact.
+    """
+
+    def __init__(self, enabled=True, plain=False, min_interval=0.2):
+        self.enabled = enabled
+        self.plain = plain or not sys.stdout.isatty()
+        self.min_interval = min_interval
+        self._width = 0
+        self._open = False
+        self._last = 0.0
+
+    def update(self, text):
+        """Redraw the line. Cheap to call every batch: it throttles itself."""
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        if now - self._last < self.min_interval:
+            return
+        self._last = now
+        if self.plain:
+            print(text, flush=True)
+            return
+        # The pad clears whatever the previous, possibly longer, line left.
+        pad = max(0, self._width - len(text))
+        sys.stdout.write("\r" + text + " " * pad)
+        sys.stdout.flush()
+        self._width = len(text)
+        self._open = True
+
+    def line(self, text=""):
+        """Finish the live line and print a permanent one."""
+        if not self.enabled:
+            return
+        self.clear()
+        print(text, flush=True)
+
+    def clear(self):
+        if not self.enabled or not self._open:
+            return
+        if not self.plain:
+            sys.stdout.write("\r" + " " * self._width + "\r")
+            sys.stdout.flush()
+        self._width = 0
+        self._open = False
 
 
 def collate_fn(batch):
@@ -275,6 +339,21 @@ class WFLModel(pl.LightningModule):
         total_val = config["data"]["num_val_files"]
         self.num_vis_samples = min(total_val, 8)
 
+        # One rewritten line instead of a scrolling bar. See StatusLine.
+        console = config.get("training", {})
+        self.status = StatusLine(
+            enabled=console.get("live_console", True),
+            plain=console.get("plain_console", False),
+        )
+        # Initialised here, not in on_train_epoch_start: the sanity-check pass
+        # runs before any training step and reads these.
+        self._loss_ema = None
+        self._epoch_start = time.monotonic()
+        self._run_start = self._epoch_start
+        self._steps_per_epoch = 0
+        self._val_batches = 0
+        self._val_printed_epoch = None
+
     def forward(self, x, lang_ids, lengths):
         return self.model(x, lang_ids, lengths=lengths)
 
@@ -324,10 +403,13 @@ class WFLModel(pl.LightningModule):
             self.log("train/nonfinite_steps", self._nonfinite_steps, on_step=True,
                      prog_bar=(self._nonfinite_steps <= 5))
             if self._nonfinite_steps <= 5:
-                print(f"\n[!] non-finite loss at step {batch_idx} "
-                      f"(total {self._nonfinite_steps}) -- step skipped. "
-                      f"The encoder is in fp32; if it persists, try "
-                      f"training.precision: 32.")
+                self.status.line(
+                    f"epoch {self.current_epoch + 1}/{self.trainer.max_epochs}"
+                    f" [!] non-finite loss at step {batch_idx}"
+                    f" (total {self._nonfinite_steps}) -- step skipped."
+                    f" The encoder is in fp32; if it persists, try"
+                    f" training.precision: 32."
+                )
             return None
 
         self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=inputs.size(0))
@@ -335,8 +417,89 @@ class WFLModel(pl.LightningModule):
         self.log("train/off_loss", off_loss, on_step=False, on_epoch=True, batch_size=inputs.size(0))
         return loss
 
+    def on_train_epoch_start(self):
+        self._loss_ema = None
+        self._epoch_start = time.monotonic()
+        self._run_start = getattr(self, "_run_start", time.monotonic())
+        try:
+            self._steps_per_epoch = len(self.trainer.train_dataloader)
+        except (TypeError, RuntimeError):
+            self._steps_per_epoch = 0
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        loss = outputs.get("loss") if isinstance(outputs, dict) else outputs
+        if loss is None:
+            return  # non-finite step, already counted in training_step
+        value = float(loss.detach())
+        self._loss_ema = value if self._loss_ema is None else (
+            0.9 * self._loss_ema + 0.1 * value
+        )
+        self.status.update(self._train_line(batch_idx, value))
+
+    def _phase(self):
+        # Lightning runs a validation pass before training starts. It is worth
+        # seeing when it fails, but it is not an epoch and must not be labelled
+        # as one.
+        return "sanity check" if self.trainer.sanity_checking else (
+            f"epoch {self.current_epoch + 1:>4}/{self.trainer.max_epochs:<4}"
+        )
+
+    def _train_line(self, batch_idx, value):
+        total = self._steps_per_epoch or 1
+        done = (batch_idx + 1) / total
+        elapsed = time.monotonic() - self._epoch_start
+        rate = (batch_idx + 1) / elapsed if elapsed > 0 else 0.0
+        remaining = (self.trainer.max_epochs - self.current_epoch - 1) * total
+        eta = remaining / rate if rate > 0 else 0.0
+        return (
+            f"{self._phase()}"
+            f" batch {batch_idx + 1:>5}/{total:<5}"
+            f" loss {value:7.4f}"
+            f" lr {self._lr():>10}"
+            f"  {done * 100:5.1f}%  elapsed {int(elapsed):>5}s"
+            f"  eta {int(eta) // 3600:d}:{int(eta) % 3600 // 60:02d}:"
+            f"{int(eta) % 60:02d}"
+        )
+
+    def _lr(self):
+        try:
+            return f"{self.optimizers().param_groups[0]['lr']:.2e}"
+        except (RuntimeError, AttributeError, IndexError):
+            return "-"
+
+    def on_train_epoch_end(self):
+        # Lightning fires this AFTER the validation pass for the epoch, so when
+        # validation ran, its line has to carry the training numbers too --
+        # otherwise the two lines read out of order.
+        if getattr(self, "_val_printed_epoch", None) == self.current_epoch:
+            return
+        metrics = self.trainer.callback_metrics
+        if self._loss_ema is None:
+            return
+        self.status.line(
+            f"{self._phase()} train  mean loss "
+            f"{metrics.get('train/loss_epoch', float('nan')):.4f}"
+            f"  cls {metrics.get('train/cls_loss', float('nan')):.4f}"
+            f"  off {metrics.get('train/off_loss', float('nan')):.4f}"
+            f"  (no validation this epoch)"
+        )
+
+    def on_validation_batch_end(self, outputs, batch, batch_idx):
+        loss = outputs.get("loss") if isinstance(outputs, dict) else outputs
+        if loss is None:
+            return
+        total = self._val_batches or 1
+        self.status.update(
+            f"{self._phase()} validating {batch_idx + 1:>4}/{total:<4}"
+            f" loss {float(loss.detach()):7.4f}"
+        )
+
     def on_validation_epoch_start(self):
         self.val_vis_count = 0
+        try:
+            self._val_batches = len(self.trainer.val_dataloaders[0])
+        except (TypeError, IndexError, RuntimeError):
+            self._val_batches = 0
 
     def validation_step(self, batch, batch_idx):
         inputs, labels, wavs, segs_gt, _, langs, lengths = batch
@@ -452,20 +615,28 @@ class WFLModel(pl.LightningModule):
 
     def on_validation_epoch_end(self):
         metrics = self.trainer.callback_metrics
-        print(
-            f"\n[Epoch {self.current_epoch}] "
-            f"Loss: {metrics.get('val/loss', 0.0):.4f} | "
-            f"Frame accuracy: {metrics.get('val/acc', 0.0):.2f}% | "
-            f"PER: {metrics.get('val/per', float('nan')):.2f}%"
-        )
-        f1 = " | ".join(
-            f"F1@{tol}ms {metrics.get(f'val/boundary_f1@{tol}ms', float('nan')) * 100:.1f}%"
+        if not self.trainer.sanity_checking:
+            # The sanity check runs as current_epoch 0, before any training. If
+            # it set this, the first real epoch's train line would be suppressed.
+            self._val_printed_epoch = self.current_epoch
+        f1 = "  ".join(
+            f"F1@{tol} {metrics.get(f'val/boundary_f1@{tol}ms', float('nan')) * 100:.1f}%"
             for tol in self.boundary_tolerances_ms
         )
-        print(
-            f"  Boundaries: MAE {metrics.get('val/boundary_mae_ms', float('nan')):.1f} ms | {f1}"
-            f" | files scored {metrics.get('val/per_files_pct', 0.0):.0f}%"
-            f" | unlabelled frames {metrics.get('val/unlabelled_pct', 0.0):.2f}%"
+        # One line per epoch. The previous version printed two, with a leading
+        # blank line, which is what tore the progress bar apart.
+        self.status.line(
+            f"{self._phase()} VALID"
+            f"  loss {metrics.get('val/loss', float('nan')):7.4f}"
+            f"  acc {metrics.get('val/acc', float('nan')):6.2f}%"
+            f"  PER {metrics.get('val/per', float('nan')):6.2f}%"
+            f"  bMAE {metrics.get('val/boundary_mae_ms', float('nan')):5.1f}ms"
+            f"  {f1}"
+            f"  files {metrics.get('val/per_files_pct', float('nan')):5.1f}%"
+            f"  unlab {metrics.get('val/unlabelled_pct', float('nan')):.2f}%"
+            # train/loss_epoch is not reduced yet -- on_epoch metrics land after
+            # this hook -- so the step EMA is the only current figure available.
+            f"  | trn {self._loss_ema if self._loss_ema is not None else float('nan'):7.4f}"
         )
 
     def _log_visualization(self, wav, pred_segments, gt_segments, sample_idx=0):
@@ -554,7 +725,13 @@ def main():
         # comes entirely from the trainable head, with no precision risk.
         precision=config["training"].get("precision", "16-mixed"),
         gradient_clip_val=1.0,
-        log_every_n_steps=10
+        log_every_n_steps=10,
+        # The built-in bar is replaced by StatusLine. Off a terminal (which is
+        # what Colab gives you) tqdm stops redrawing in place and emits a full
+        # line plus a ~15-line metrics table per refresh, so the cell fills up
+        # with scrollback and the live numbers scroll out of view.
+        enable_progress_bar=config["training"].get("progress_bar", False),
+        enable_model_summary=False,
     )
 
     print(f"Starting Training for {max_epochs} epochs (Validation every {check_val_every_n_epoch} epochs)...")

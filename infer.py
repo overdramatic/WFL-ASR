@@ -97,7 +97,22 @@ def encode_audio(
         expected_frames = math.ceil(
             (end - start) / sr / config["data"]["frame_duration"]
         )
-        input_values = torch.tensor(chunk, dtype=torch.float32).unsqueeze(0).to(device)
+        # The training path gets its mel from FeatureCollator (see train.py).
+        # There is no DataLoader here, so forward() cannot expect precomputed
+        # features: it raises unless we hand it (B, n_mels, frames). The
+        # non-whisper path still wants the raw waveform.
+        if (
+            getattr(model, "encoder_type", "") == "whisper"
+            and getattr(model, "precompute_features", False)
+        ):
+            input_values = model.feature_extractor(
+                np.asarray(chunk, dtype=np.float32), sampling_rate=16000,
+                return_tensors="pt",
+            )["input_features"].to(device)
+        else:
+            input_values = (
+                torch.tensor(chunk, dtype=torch.float32).unsqueeze(0).to(device)
+            )
         lengths = torch.tensor([expected_frames], device=device)
 
         with torch.no_grad():
