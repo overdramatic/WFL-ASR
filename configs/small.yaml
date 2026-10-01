@@ -2,7 +2,13 @@
 data:
   data_dir: "training_dataset"
   sample_rate: 16000
-  num_val_files: 4
+  # Per-phone error rates on 4 files are noise: a phoneme seen twice with one
+  # error reads 50%, so a "fix" can be a single lucky file. 30 is a floor for
+  # ranking phonemes, not a target -- raise it if the corpus allows.
+  # Raising it multiplies validation cost, so check_val_every_n_epoch below was
+  # bumped to compensate. Changing this invalidates data_split.json: delete it
+  # (on Drive, if save_dir is mounted there) or the run stops with a mismatch.
+  num_val_files: 30
   max_seq_len: null
   frame_duration: 0.02
   n_mels: 80
@@ -28,6 +34,15 @@ model:
   # totally frozen encoder. below 30 mins is not enough to finetune whisper
   freeze_encoder: true
   unfreeze_last_n_layers: 0
+
+  # SpecAugment on encoder hidden states (applied after weighted sum of layers).
+  # prob=0: disabled. prob>0: gate, only that fraction of batches is augmented.
+  # time_mask_param: max frames to mask (at 20ms/frame, 15 = 300ms).
+  # mask_value: "mean" fills masked positions with channel mean (better than 0).
+  spec_aug_freq: 0
+  spec_aug_time: 15
+  spec_aug_prob: 0.3
+  spec_aug_mask_value: "mean"
 
   num_conformer_layers: 2
   conformer_heads: 2
@@ -62,7 +77,7 @@ training:
   weight_decay: 0.01
 
   max_epochs: 1000
-  check_val_every_n_epoch: 1 # Validate every epoch
+  check_val_every_n_epoch: 2 # Validate every 2 epochs (was 1: 7.5x the val files)
   lr_decay_every_n_epochs: 1 # lr reduce every epoch
   lr_decay_gamma: 0.9
 
@@ -85,9 +100,88 @@ postprocess:
   # (the forced-alignment path uses forced_alignment_args below).
   # Sweep this with tune_decode.py -- it is worth real PER.
   viterbi_bias: 5
+
+  # Which phoneme is which type: see phoneme_map.yaml at the repo root. The
+  # inventory belongs to the corpus, not to this file -- a model can be trained
+  # on any language with any dictionary. Types are resolved PER LANGUAGE,
+  # because the same string is not the same sound everywhere ("j" is a fricative
+  # in pt and an affricate in ja).
+  #
+  # Point this at your own map if you trained on other languages. A type outside
+  # decode.TYPE_CLASSES is a hard error, not a warning: those phonemes would
+  # silently fall back to one class and the numbers would look fine.
+  phoneme_map: phoneme_map.yaml
+
+  # Per-class stay bonus, in nats PER FRAME spent on the current phoneme.
+  # This is a BONUS: bigger = stays on the phoneme longer. viterbi_bias above is
+  # the same number as log(bias), so viterbi_bias=5 is exactly 1.61.
+  #
+  # The sign is NOT the forced aligner's sign, on purpose. Here, LEAVING a
+  # phoneme is free, so the I- transition value alone decides how long a
+  # phoneme lasts -- a negative value would pay the decoder to leave after
+  # every frame and shatter everything into one-frame phonemes. The forced
+  # aligner already knows the phone order and only chooses between staying and
+  # advancing, so BOTH of its costs are negative. See decode.viterbi_decode.
+  #
+  # One global value has to stretch a 120 ms vowel and a 15 ms plosive burst at
+  # the same time, and is good at neither: too much bonus and a confident but
+  # wrong phoneme swallows its neighbour (a fusion, which lands on exactly the
+  # common phonemes); too little and it fragments. Four numbers cost nothing
+  # and sweep with tune_decode.py.
+  #
+  # Keys are read at either granularity. A DURATION CLASS applies to every type
+  # inside it (sonorant = nasal, liquid, trill, rhotic, semivowel); a TYPE
+  # overrides just that one, which is worth it when a class is too coarse --
+  # pt/rr is a trill and long, es/rr is a liquid, and the map can tell them
+  # apart even though the class cannot. `obstruent` still works as an alias for
+  # fricative+stop, since that is what the class used to be.
+  #
+  # Set to {} (or delete the block) to fall back to viterbi_bias above. When
+  # this is set, viterbi_bias is ignored -- there is no silent precedence.
+  stickiness_bonus_by_class:
+    vowel: 1.79       # log(6): long, keep it long
+    sonorant: 1.61    # log(5): nasals, liquids, trills
+    fricative: 1.10   # log(3): sustained noise
+    stop: 1.10        # log(3): a burst is ~1-2 frames
+
+  # Minimum phoneme duration in seconds. Moves boundaries only, so the phone
+  # sequence is preserved (safe on top of forced alignment). 0.0 disables it.
+  # A principled per-class floor is ~0.02-0.03 for obstruents and ~0.04-0.07
+  # for vowels; one global number has to compromise. See utils.enforce_min_duration.
+  min_phoneme_duration: 0.0
+
   merge_segments: "right"
+
+  # Long audio is encoded in overlapping windows; each window keeps only its
+  # middle, so a phoneme on a seam is decoded with context on both sides.
+  # overlap_sec: 0 goes back to non-overlapping windows. Keep chunk_sec at 28
+  # so the Whisper mel padding matches training.
+  chunking:
+    max_sec: 28.0
+    overlap_sec: 2.0
+
+  # Amplitude-based silence. Applied to the output when there is no transcript;
+  # with a transcript it is used only as EVIDENCE for where the pauses are, and
+  # those pauses get inserted into the phone sequence (pad_transcript) instead.
+  # Without them the forced aligner stretches speech phonemes across the gaps.
+  hard_silence:
+    threshold: 0.005
+    min_duration: 0.5
+    silence_phoneme: "SP"
+    pad_transcript: true
+
   forced_alignment_args:
-    self_loop_penalty: -4.6 # penalty for staying on the phoneme
+    # Same sign convention as self_loop_penalty_by_class above: negative = cost
+    # per frame for staying. NOT comparable in magnitude to the free path's
+    # -1.61: forced alignment knows the phone order and only has to place
+    # boundaries, so it can afford a much stronger stickiness. Sweep both on
+    # the same validation split.
+    self_loop_penalty: -4.6
+    self_loop_penalty_by_class:
+      vowel: -5.0
+      sonorant: -4.6
+      fricative: -3.5
+      stop: -3.5
     forward_penalty: -0.6 # penalty for switching to the next phoneme
     skip_penalty: -2.3 # penalty for skipping I phonemes
 

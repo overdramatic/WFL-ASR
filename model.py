@@ -46,48 +46,89 @@ class FocalLoss(nn.Module):
         return loss[valid].sum() / valid.sum().clamp_min(1)
 
 class SpecAugment(nn.Module):
-    def __init__(self, freq_mask_param=20, time_mask_param=30):
+    """
+    SpecAugment with probability gate, configurable mask value, and mask return.
+
+    The mask is needed so that losses can ignore the augmented frames -- otherwise
+    the model is penalized for not predicting what was deliberately hidden.
+    """
+    def __init__(
+        self,
+        freq_mask_param: int = 0,
+        time_mask_param: int = 0,
+        prob: float = 0.0,
+        mask_value: str = "mean",  # "mean" | "zero"
+    ):
         super().__init__()
         self.freq_mask_param = freq_mask_param
         self.time_mask_param = time_mask_param
+        self.prob = prob
+        self.mask_value = mask_value
 
     def forward(self, x, lengths):
-        if not self.training:
-            return x
+        if not self.training or self.prob <= 0.0:
+            # Return x and an all-False mask so the caller can always unpack
+            return x, torch.zeros_like(x, dtype=torch.bool)
+
+        # Gate: with probability (1 - prob), do nothing
+        if torch.rand(1, device=x.device).item() > self.prob:
+            return x, torch.zeros_like(x, dtype=torch.bool)
 
         batch, frames, channels = x.shape
         lengths = lengths.to(device=x.device, dtype=torch.long)
+
+        # Per-sample time mask width (in frames), clamped to time_mask_param
         time_limit = (lengths // 5).clamp(max=self.time_mask_param)
         time_width = (torch.rand(batch, device=x.device) * (time_limit + 1)).long()
         time_start = (
-            torch.rand(batch, device=x.device) * (lengths - time_width + 1)
+            torch.rand(batch, device=x.device) * (lengths - time_width + 1).clamp(min=1)
         ).long()
 
+        # Per-sample feature mask width
         feature_limit = min(self.freq_mask_param, channels - 1)
         feature_width = torch.randint(
             feature_limit + 1, (batch,), device=x.device
         )
         feature_start = (
-            torch.rand(batch, device=x.device) * (channels - feature_width + 1)
+            torch.rand(batch, device=x.device) * (channels - feature_width + 1).clamp(min=1)
         ).long()
 
         t = torch.arange(frames, device=x.device)[None, :]
         c = torch.arange(channels, device=x.device)[None, :]
+
         time_mask = (t >= time_start[:, None]) & (
             t < (time_start + time_width)[:, None]
         )
         feature_mask = (c >= feature_start[:, None]) & (
             c < (feature_start + feature_width)[:, None]
         )
-        mask = torch.logical_or(
+
+        # Combined mask: True = this (frame, channel) is masked
+        # Shape: (batch, frames, channels)
+        aug_mask = torch.logical_or(
             time_mask[:, :, None],
             feature_mask[:, None, :],
         )
-        mask = torch.logical_or(
-            mask,
+        # Don't mask padding positions (beyond lengths)
+        aug_mask = torch.logical_or(
+            aug_mask,
             (t >= lengths[:, None])[:, :, None],
         )
-        return x.masked_fill(mask, 0)
+
+        # Mask value: mean over unmasked positions per channel (per batch)
+        if self.mask_value == "mean":
+            # Compute mean over unmasked (valid & not augmented) positions
+            valid = (t < lengths[:, None]).unsqueeze(-1)  # (batch, frames, 1)
+            unmasked = valid & ~aug_mask
+            # Sum over frames, divide by count
+            denom = unmasked.sum(dim=1).clamp_min(1)  # (batch, channels)
+            mean_val = (x * unmasked).sum(dim=1) / denom  # (batch, channels)
+            # Use torch.where for proper broadcasting (masked_fill only takes scalar)
+            fill = mean_val[:, None, :]  # (batch, 1, channels)
+            x_aug = torch.where(aug_mask, fill.expand_as(x), x)
+        else:
+            x_aug = x.masked_fill(aug_mask, 0.0)
+        return x_aug, aug_mask
 
 class FeedForwardModule(nn.Module):
     def __init__(self, dim, expansion=4, dropout=0.1):
@@ -196,7 +237,12 @@ class BIOPhonemeTagger(nn.Module):
                             for param in layer.parameters():
                                 param.requires_grad = True
 
-        self.spec_aug = SpecAugment()
+        self.spec_aug = SpecAugment(
+            freq_mask_param=config["model"].get("spec_aug_freq", 0),
+            time_mask_param=config["model"].get("spec_aug_time", 0),
+            prob=config["model"].get("spec_aug_prob", 0.0),
+            mask_value=config["model"].get("spec_aug_mask_value", "mean"),
+        )
         
         self.conformer_layers = nn.ModuleList([
             ConformerBlock(
@@ -293,8 +339,13 @@ class BIOPhonemeTagger(nn.Module):
             raise ValueError("Labels exceed encoder output. Split long audio first.")
 
         hidden_states = hidden_states[:, :max_len]
+        # SpecAugment returns (augmented_states, aug_mask) where aug_mask is
+        # True for positions that were masked. We need this mask in the loss
+        # to ignore the augmented frames (they are synthetic holes).
         if self.training:
-            hidden_states = self.spec_aug(hidden_states, lengths)
+            hidden_states, aug_mask = self.spec_aug(hidden_states, lengths)
+        else:
+            aug_mask = None
             
         valid = torch.arange(max_len, device=input_values.device)[None, :] < lengths[:, None]
         mask = valid.unsqueeze(-1)
@@ -318,4 +369,4 @@ class BIOPhonemeTagger(nn.Module):
             self.boundary_offset_head, out.transpose(1, 2), valid
         ).transpose(1, 2)
         
-        return logits, offsets
+        return logits, offsets, aug_mask

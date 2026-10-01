@@ -22,15 +22,16 @@ from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from torch.utils.data import Dataset, DataLoader, Subset, random_split
 from model import BIOPhonemeTagger, FocalLoss
 from utils import (
+    PhoneErrorAccumulator,
     boundary_counts,
     collapse_repeated,
     decode_bio_tags,
     load_phoneme_list,
-    phone_error_rate,
+    plot_confusion_matrix,
     visualize_prediction,
 )
 import pytorch_optimizer as optim
-from decode import continuous_segments, viterbi_decode
+from decode import continuous_segments, load_phoneme_types, viterbi_decode
 
 
 class StatusLine:
@@ -234,6 +235,21 @@ class WFLDataModule(pl.LightningDataModule):
         paths = [s["wav_path"] for s in train_dataset.samples]
         indices = {p: i for i, p in enumerate(paths)}
         val_count = self.config["data"]["num_val_files"]
+
+        if val_count < 1:
+            raise ValueError("data.num_val_files must be at least 1.")
+        if val_count >= len(paths):
+            # The 30-file default is right for a real corpus and meaningless on
+            # a 20-file one. Clamping with a message beats the "Split mismatch"
+            # error further down, which points at data_split.json and sends you
+            # deleting the wrong file.
+            clamped = max(1, len(paths) // 4)
+            print(
+                f">>> data.num_val_files={val_count} but the dataset has only "
+                f"{len(paths)} files. Using {clamped} instead."
+            )
+            val_count = clamped
+
         split_path = os.path.join(self.save_dir, "data_split.json")
 
         if len(indices) != len(paths):
@@ -262,7 +278,12 @@ class WFLDataModule(pl.LightningDataModule):
             or set(saved) != set(paths)
             or len(split["val_paths"]) != val_count
         ):
-            raise ValueError("Split mismatch. Restore the dataset/config or rename data_split.json to create a new split")
+            raise ValueError(
+                f"Split mismatch: data_split.json has {len(split['val_paths'])} "
+                f"validation files but the config asks for {val_count}. "
+                f"Delete {split_path} to regenerate the split "
+                f"(the old validation numbers are then no longer comparable)."
+            )
 
         self.train_ds = Subset(
             train_dataset, [indices[p] for p in split["train_paths"]]
@@ -329,6 +350,75 @@ class WFLModel(pl.LightningModule):
         self.viterbi_bias = config.get("postprocess", {}).get(
             "viterbi_bias", config.get("validation", {}).get("viterbi_bias", 5)
         )
+        # A per-class stay bonus (see decode.phone_class) separates the long
+        # vowels from the short plosive bursts, which one global value cannot
+        # do. When it is set it fully replaces viterbi_bias, so the two are
+        # never both in play.
+        #
+        # The old key was self_loop_penalty_by_class and held NEGATIVE costs,
+        # which on this decoder means a cost for staying -- that is the
+        # fragmentation bug, and silently ignoring the old key would look like
+        # it worked while measuring a different decoder than inference runs. So
+        # a negative legacy block is refused loudly here too.
+        _post = config.get("postprocess", {})
+        self.penalty_by_class = _post.get("stickiness_bonus_by_class")
+        _legacy = _post.get("self_loop_penalty_by_class")
+        if self.penalty_by_class and _legacy:
+            raise ValueError(
+                "postprocess has both stickiness_bonus_by_class and "
+                "self_loop_penalty_by_class; keep the first and delete the other."
+            )
+        if _legacy:
+            _neg = {
+                k: v for k, v in _legacy.items()
+                if isinstance(v, (int, float)) and v < 0
+            }
+            if _neg:
+                raise ValueError(
+                    f"postprocess.self_loop_penalty_by_class has negative values "
+                    f"{_neg}, which is a COST for staying on a phoneme and "
+                    "shatters the decode into one-frame phonemes. Use "
+                    "stickiness_bonus_by_class with the values negated: "
+                    + ", ".join(f"{k}: {-v:g}" for k, v in sorted(_neg.items()))
+                )
+            self.penalty_by_class = _legacy
+            print("[WFLModel] postprocess.self_loop_penalty_by_class is deprecated; "
+                  "treating it as stickiness_bonus_by_class.")
+        # Which phoneme is which type. Validation has to decode exactly like
+        # inference does, or val/per measures a different decoder than the one
+        # that ships -- and a missing map here is the difference between the
+        # per-type penalties doing their job and collapsing to one value.
+        map_path = (
+            config.get("postprocess", {}).get("phoneme_map") or "phoneme_map.yaml"
+        )
+        try:
+            self.phoneme_types = load_phoneme_types(
+                map_path, warn=lambda msg: print(f"[WFLModel] {msg}")
+            )
+        except FileNotFoundError as exc:
+            # A missing map costs accuracy, not correctness: every phoneme falls
+            # back to the middle class and val/per still measures a real decode.
+            # A malformed map is a different matter and does raise (below).
+            print(f"[WFLModel] {exc}; val/per will use one class for all phonemes.")
+            self.phoneme_types = None
+
+        # lang_id -> lang name, so the per-language types can be applied: "j" is a
+        # fricative in pt and an affricate in ja, and validation has to ask the
+        # map the same way preprocess.py labelled the file.
+        self.id2lang = {}
+        langs_path = os.path.join(config["output"]["save_dir"], "langs.txt")
+        if os.path.exists(langs_path):
+            with open(langs_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    parts = line.strip().split(",")
+                    if len(parts) == 2 and parts[1].strip().isdigit():
+                        self.id2lang[int(parts[1])] = parts[0]
+        # Per-phone error rates measured on a handful of files are noise: a
+        # phoneme seen twice with one error reads 50%. This floor keeps a
+        # singleton out of the ranking.
+        self._phone_err = PhoneErrorAccumulator(
+            min_count=max(2, config["data"]["num_val_files"] // 5)
+        )
         # Boundary accuracy in ms is the metric that matters for a labeller:
         # PER collapses repeated phonemes and throws all timing away.
         self.boundary_tolerances_ms = sorted(
@@ -357,10 +447,35 @@ class WFLModel(pl.LightningModule):
     def forward(self, x, lang_ids, lengths):
         return self.model(x, lang_ids, lengths=lengths)
 
-    def calculate_loss(self, logits, offsets, labels, segs_gt, lengths):
-        cls_loss = self.criterion(
-            logits.reshape(-1, logits.size(-1)), labels.reshape(-1)
-        )
+    def calculate_loss(self, logits, offsets, labels, segs_gt, lengths, aug_mask=None):
+        """
+        Compute classification and offset losses, ignoring SpecAugment-masked frames.
+
+        aug_mask: (batch, frames, channels) or (batch, frames) or None.
+                  True = this frame was augmented (should be ignored in loss).
+        """
+        # Frame-level mask: True if any channel of this frame was masked
+        if aug_mask is not None:
+            if aug_mask.dim() == 3:
+                frame_aug_mask = aug_mask.any(dim=-1)  # (batch, frames)
+            else:
+                frame_aug_mask = aug_mask  # already (batch, frames)
+            # Valid frames are those NOT augmented
+            loss_valid = ~frame_aug_mask
+        else:
+            loss_valid = None
+
+        # Classification loss: ignore augmented frames
+        if loss_valid is not None:
+            # Flatten and mask
+            flat_logits = logits.reshape(-1, logits.size(-1))
+            flat_labels = labels.reshape(-1)
+            flat_valid = loss_valid.reshape(-1)
+            cls_loss = self.criterion(flat_logits[flat_valid], flat_labels[flat_valid])
+        else:
+            cls_loss = self.criterion(
+                logits.reshape(-1, logits.size(-1)), labels.reshape(-1)
+            )
 
         total_offset_loss = torch.tensor(0.0, device=self.device)
         if offsets is not None:
@@ -379,6 +494,10 @@ class WFLModel(pl.LightningModule):
                         target_map[b_idx, e_f, 1] = end_t / self.frame_duration - e_f
                         mask_map[b_idx, e_f, 1] = 1.0
 
+            # Also ignore augmented frames in offset loss
+            if loss_valid is not None:
+                mask_map = mask_map * loss_valid.unsqueeze(-1)
+
             diff = torch.abs(offsets - target_map) * mask_map
             total_offset_loss = (
                 diff.sum() / (mask_map.sum() + 1e-8)
@@ -389,9 +508,9 @@ class WFLModel(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         inputs, labels, wavs, segs_gt, _, langs, lengths = batch
-        logits, offsets = self(inputs, langs, lengths)
+        logits, offsets, aug_mask = self(inputs, langs, lengths)
         loss, cls_loss, off_loss = self.calculate_loss(
-            logits, offsets, labels, segs_gt, lengths
+            logits, offsets, labels, segs_gt, lengths, aug_mask
         )
 
         # Safety net for mixed precision. fp16 can overflow (Inf/NaN) in
@@ -496,6 +615,7 @@ class WFLModel(pl.LightningModule):
 
     def on_validation_epoch_start(self):
         self.val_vis_count = 0
+        self._phone_err.reset()
         try:
             self._val_batches = len(self.trainer.val_dataloaders[0])
         except (TypeError, IndexError, RuntimeError):
@@ -503,7 +623,7 @@ class WFLModel(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         inputs, labels, wavs, segs_gt, _, langs, lengths = batch
-        logits, offsets = self(inputs, langs, lengths)
+        logits, offsets, _ = self(inputs, langs, lengths)  # aug_mask is None in eval
         loss, cls_loss, off_loss = self.calculate_loss(
             logits, offsets, labels, segs_gt, lengths
         )
@@ -530,8 +650,6 @@ class WFLModel(pl.LightningModule):
             self.log(f"val/{name}", value, on_step=False, on_epoch=True,
                      prog_bar=name == "loss", batch_size=inputs.size(0))
 
-        errors, phone_count = 0, 0
-        files_scored, files_empty = 0, 0
         ref_bnd_n, hyp_bnd_n = 0, 0
         matched = {tol: 0 for tol in self.boundary_tolerances_ms}
         abs_err, abs_err_n = 0.0, 0
@@ -540,7 +658,10 @@ class WFLModel(pl.LightningModule):
             length = int(lengths[i].item())
             duration = len(wav) / 16000
             tags = viterbi_decode(
-                logits[i, :length], self.id2label, viterbi_bias=self.viterbi_bias
+                logits[i, :length], self.id2label, viterbi_bias=self.viterbi_bias,
+                penalty_by_class=self.penalty_by_class,
+                phoneme_types=self.phoneme_types,
+                lang=self.id2lang.get(int(langs[i].item())),
             )
             pred_segments = continuous_segments(
                 decode_bio_tags(
@@ -564,13 +685,10 @@ class WFLModel(pl.LightningModule):
             # required a file with ZERO unlabelled frames, which silently
             # dropped any file whose tail was not annotated -- HTK .lab files
             # routinely end a few ms before the audio does.
-            if reference:
-                files_scored += 1
-                errors_i, ref_n = phone_error_rate(reference, prediction)
-                errors += errors_i
-                phone_count += ref_n
-            else:
-                files_empty += 1
+            # `phone_error_detail` replaces `phone_error_rate` here rather than
+            # adding to it: both run the same DP, so the traceback is nearly
+            # free and the extra work is the per-file backtrack.
+            self._log_phone_errors(reference, prediction)
 
             matches, err_sum, err_n, n_ref, n_hyp = boundary_counts(
                 gt_segments, pred_segments, self.boundary_tolerances_ms
@@ -588,16 +706,13 @@ class WFLModel(pl.LightningModule):
                 )
                 self.val_vis_count += 1
 
-        if files_scored + files_empty:
+        if self._phone_err.files_scored + self._phone_err.files_empty:
             self.log(
                 "val/per_files_pct",
-                100.0 * files_scored / (files_scored + files_empty),
+                100.0 * self._phone_err.files_scored
+                / (self._phone_err.files_scored + self._phone_err.files_empty),
                 on_step=False, on_epoch=True, batch_size=inputs.size(0),
             )
-        if phone_count:
-            self.log("val/per", 100.0 * errors / phone_count,
-                     on_step=False, on_epoch=True, prog_bar=True,
-                     batch_size=phone_count)
         if abs_err_n:
             self.log("val/boundary_mae_ms", 1000.0 * abs_err / abs_err_n,
                      on_step=False, on_epoch=True, batch_size=abs_err_n)
@@ -613,12 +728,68 @@ class WFLModel(pl.LightningModule):
                 )
         return loss
 
+    def _log_phone_errors(self, reference, prediction):
+        """One file into the accumulator, and the same numbers into the loggers.
+
+        Logged HERE, from inside the step, because that is the only place where
+        Lightning aggregates epoch metrics: `on_validation_epoch_end` runs after
+        the reduction, so anything logged there skips it -- and `val/per` is
+        what ModelCheckpoint monitors.
+
+        Each rate is a fraction of THIS file's reference length, passed with
+        `batch_size` set to that same length. Lightning then takes a
+        length-weighted mean across the epoch, which is exactly the pooled
+        ratio -- not the mean of the per-file ratios, which would over-weight a
+        short file. Confusion pairs are counts, so they reduce with "sum".
+        """
+        detail = self._phone_err.update(reference, prediction)
+        if detail is None:
+            return
+        n_ref = len(reference)
+        if not n_ref:
+            return
+
+        errors = detail["S"] + detail["D"] + detail["I"]
+        for name, count in (
+            ("per", errors), ("sub", detail["S"]),
+            ("del", detail["D"]), ("ins", detail["I"]),
+        ):
+            self.log(
+                f"val/{name}", 100.0 * count / n_ref,
+                on_step=False, on_epoch=True, prog_bar=(name == "per"),
+                batch_size=n_ref,
+            )
+
+        # One scalar per phoneme, so a regression in /a/ shows up in TensorBoard
+        # on its own instead of hiding inside the aggregate. The set of keys
+        # varies per file; Lightning keeps each key's own total, and a file
+        # simply contributes nothing to a phoneme it does not contain.
+        for ph, v in detail["per_phone"].items():
+            self.log(
+                f"val/phone_er/{ph}", 100.0 * (v["S"] + v["D"]) / v["n"],
+                on_step=False, on_epoch=True, batch_size=v["n"],
+            )
+        for (ref, hyp), count in detail["confusion"].items():
+            self.log(
+                f"val/confusion/{ref}->{hyp}", float(count),
+                on_step=False, on_epoch=True, reduce_fx="sum",
+            )
+
     def on_validation_epoch_end(self):
         metrics = self.trainer.callback_metrics
         if not self.trainer.sanity_checking:
             # The sanity check runs as current_epoch 0, before any training. If
             # it set this, the first real epoch's train line would be suppressed.
             self._val_printed_epoch = self.current_epoch
+
+        # No self.log() here on purpose -- see _log_phone_errors. The metrics
+        # are already reduced into `metrics` by the time this hook runs; the
+        # accumulator is the source of truth for the console lines, and
+        # rates() is arithmetically identical to the logged val/per, so the two
+        # cannot disagree.
+        if self._phone_err.n_ref:
+            self._log_confusion_matrix()
+
         f1 = "  ".join(
             f"F1@{tol} {metrics.get(f'val/boundary_f1@{tol}ms', float('nan')) * 100:.1f}%"
             for tol in self.boundary_tolerances_ms
@@ -638,6 +809,29 @@ class WFLModel(pl.LightningModule):
             # this hook -- so the step EMA is the only current figure available.
             f"  | trn {self._loss_ema if self._loss_ema is not None else float('nan'):7.4f}"
         )
+        if self._phone_err.n_ref:
+            self.status.line(f"{self._phase()}      {self._phone_err.summary_line()}")
+            self.status.line(f"{self._phase()}      {self._phone_err.detail_line()}")
+
+    def _log_confusion_matrix(self):
+        """The substitution pairs, as a figure. Logged at most once per epoch."""
+        try:
+            fig = plot_confusion_matrix(
+                self._phone_err.confusion,
+                title=f"validation confusions ({self._phone_err.n_ref} ref phones)",
+            )
+        except Exception as exc:      # a plot must never end a training run
+            print(f"  [!] confusion plot failed: {exc}")
+            return
+        if fig is None:
+            return
+        try:
+            if self.logger:
+                self.logger.experiment.add_figure(
+                    "val/confusion_matrix", fig, global_step=self.global_step
+                )
+        finally:
+            plt.close(fig)
 
     def _log_visualization(self, wav, pred_segments, gt_segments, sample_idx=0):
         fig = visualize_prediction(wav, 16000, pred_segments, gt_segments)

@@ -11,6 +11,18 @@ def load_config(path="config.yaml"):
     with open(path, "r") as f: return yaml.safe_load(f)
 
 def to_bio_tags(phonemes, num_frames, frame_duration, audio_duration):
+    """
+    Convert phoneme segments to BIO tags.
+
+    Fixes two issues from the original implementation:
+    1. Silent erasure (B2): two phonemes landing on the same s_idx caused the
+       second to overwrite the first's B- tag. Now we detect collisions and
+       shift the later phoneme to the next free frame.
+    2. 1-frame inflation: a phoneme shorter than one frame still gets a B- tag
+       (survives), but we don't write spurious I- tags. The frame assignment
+       is now exact: a phoneme occupies frames [s_idx, e_idx] where e_idx is
+       the last frame it meaningfully covers.
+    """
     if not phonemes or num_frames < 1:
         raise ValueError("Empty labels or audio.")
 
@@ -24,11 +36,27 @@ def to_bio_tags(phonemes, num_frames, frame_duration, audio_duration):
             raise ValueError(f"Overlapping phoneme: {ph}")
 
         s_idx = int(start / frame_duration)
-        e_idx = min(int(end / frame_duration), num_frames - 1)
+        # e_idx is the last frame this phoneme occupies.
+        # If end falls exactly on a frame boundary, the phoneme doesn't
+        # occupy that next frame (it belongs to the next phoneme).
+        e_idx = min(int((end - 1e-9) / frame_duration), num_frames - 1)
 
-        tags[s_idx] = f"B-{ph}"
-        for i in range(s_idx + 1, e_idx + 1):
-            tags[i] = f"I-{ph}"
+        # Collision detection: if s_idx already has a B- tag from a previous
+        # phoneme, shift this phoneme right until we find a free slot.
+        # This preserves both phonemes instead of silently erasing the first.
+        while s_idx <= e_idx and tags[s_idx].startswith("B-"):
+            s_idx += 1
+            e_idx = min(e_idx + 1, num_frames - 1)
+            if s_idx >= num_frames:
+                # No space left; drop this phoneme (should be extremely rare)
+                break
+
+        if s_idx < num_frames:
+            tags[s_idx] = f"B-{ph}"
+            # Write I- tags only for frames strictly after s_idx up to e_idx.
+            # If s_idx == e_idx (phoneme fits in one frame), no I- tags.
+            for i in range(s_idx + 1, e_idx + 1):
+                tags[i] = f"I-{ph}"
 
         previous_end = end
 
