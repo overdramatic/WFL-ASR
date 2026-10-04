@@ -61,6 +61,57 @@ Disable augmentation by setting `enable: false`.
 
 ---
 
+## Validation Metrics
+
+Every validation pass reports:
+
+| metric | meaning |
+| --- | --- |
+| `val/loss`, `val/cls_loss`, `val/off_loss` | total, tag and boundary-regression losses |
+| `val/acc` | frame-level tag accuracy |
+| `val/per` | phone error rate over the collapsed phoneme sequences |
+| `val/boundary_mae_ms` | mean boundary position error |
+| `val/boundary_f1@{20,40}ms` | boundary F-score at each tolerance |
+| `val/per_files_pct` | share of validation files that had reference phonemes |
+| `val/unlabelled_pct` | share of the validation audio no `.lab` covers |
+
+### Confusion Matrix
+
+PER says *how many* phonemes are wrong; the confusion matrix says *which*. It is
+built by aligning the decoded phoneme sequence against the original `.lab` with
+the same Levenshtein alignment PER uses, so its off-diagonal total **is** the PER
+numerator — the matrix explains the number instead of telling a different story.
+
+- `s -> SH` a lab phoneme decoded as another one (substitution)
+- `s -> <del>` a lab phoneme never decoded (deletion)
+- `<ins> -> s` a phoneme decoded without the lab asking for it (insertion)
+
+The worst pairs are appended to the `VALID` console line, and each pass logs a
+figure (`val/confusion_matrix`), a text summary (`val/confusion_top`) and the raw
+counts to `<save_dir>/confusion_matrix.csv`:
+
+```yaml
+validation:
+  confusion_matrix:
+    enabled: true     # false skips the matrix entirely
+    top_k: 25         # worst lab->decoded pairs to plot, one bar each
+    min_count: 1      # drop pairs below this count
+    normalize: true   # label each bar with the % of that lab phoneme too
+    console_top: 3    # worst pairs appended to the VALID line
+    csv: true         # raw counts to <save_dir>/confusion_matrix.csv
+```
+
+The figure is a bar chart of the worst pairs — label on the left (`s->SH`,
+`s-><del>`, `<ins>->s`), count along the axis below, worst on top, one colour per
+error kind (keyed in the title, since a legend box would sit on top of a bar).
+Ranking by count is deliberate: a phoneme wrong 400 times costs far more PER than
+one wrong twice, so the rare-but-broken phone does not sit at the top of the
+chart. The trailing `%` on each bar is the share of that lab phoneme, which is how
+you tell the two apart. The CSV keeps every scored pair, not just the plotted
+ones.
+
+---
+
 ### Phoneme Merging
 Phonemes can be merged across languages by defining `merged_phoneme_groups` in
 `config.yaml`. Each group starts with a merge label such as `merged_1` (can be anything) followed

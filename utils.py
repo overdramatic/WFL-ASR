@@ -1,7 +1,13 @@
+import csv
 import os, json
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 import numpy as np
+
+# Row/column labels for the two error kinds that have no counterpart phone:
+# a lab phoneme the decoder never produced, and a phoneme the decoder invented.
+DELETION = "<del>"
+INSERTION = "<ins>"
 
 
 def decode_bio_tags(tags, frame_duration=0.02, offsets=None):
@@ -171,6 +177,171 @@ def phone_error_rate(reference, prediction):
     return row[-1], len(reference)
 
 
+def align_phones(reference, prediction):
+    """Levenshtein alignment of two phone sequences, as (lab, decoded) pairs.
+
+    Each pair is a substitution or a correct match. `None` in a slot means the
+    phone has no counterpart on the other side: lab=None is an insertion (the
+    decoder emitted a phoneme the .lab does not have) and decoded=None is a
+    deletion (the lab phoneme was never decoded).
+
+    The path is an optimal edit alignment -- the same distance
+    phone_error_rate() measures -- so every error PER counts lands in exactly
+    one pair, which is what makes the confusion matrix below add up.
+    """
+    n, m = len(reference), len(prediction)
+    # The whole cost table, unlike phone_error_rate()'s rolling row: the
+    # traceback needs cost[i-1][j-1] of every cell, not just the last one.
+    cost = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n + 1):
+        cost[i][0] = i
+    for j in range(m + 1):
+        cost[0][j] = j
+    for i in range(1, n + 1):
+        row, prev_row = cost[i], cost[i - 1]
+        ref = reference[i - 1]
+        for j in range(1, m + 1):
+            row[j] = min(
+                prev_row[j] + 1,        # lab phoneme left undecoded (deletion)
+                row[j - 1] + 1,        # phoneme decoded out of thin air (insertion)
+                prev_row[j - 1] + (ref != prediction[j - 1]),
+            )
+
+    # Substitution/match first among the optimal moves, so a lab phone that was
+    # decoded as itself is never reported as a delete plus an insert next door.
+    pairs = []
+    i, j = n, m
+    while i or j:
+        if i and j and cost[i][j] == cost[i - 1][j - 1] + (
+            reference[i - 1] != prediction[j - 1]
+        ):
+            pairs.append((reference[i - 1], prediction[j - 1]))
+            i, j = i - 1, j - 1
+        elif i and cost[i][j] == cost[i - 1][j] + 1:
+            pairs.append((reference[i - 1], None))
+            i -= 1
+        else:
+            pairs.append((None, prediction[j - 1]))
+            j -= 1
+    pairs.reverse()
+    return pairs
+
+
+def _ranked_labels(totals):
+    """Labels by descending count, ties by name, so the order is reproducible."""
+    return [
+        label
+        for label, _ in sorted(totals.items(), key=lambda item: (-item[1], item[0]))
+    ]
+
+
+class PhoneConfusionMatrix:
+    """Counts of lab phoneme -> decoded phoneme pairs over a set of files.
+
+    PER says how many phonemes are wrong, this says which. A row is a phoneme of
+    the reference .lab and a column what the decoder put in its place: the
+    diagonal is correct, everything off it is one of the three error kinds --
+    a substitution, DELETION (lab phoneme missed) or INSERTION (phoneme
+    invented). Insertions and deletions need a slot of their own because they
+    have no phone to sit in.
+
+    `errors` is the off-diagonal total, i.e. exactly the numerator of the PER
+    built from the same files, so the matrix explains the PER rather than
+    telling a different story.
+    """
+
+    def __init__(self):
+        self.counts = {}
+
+    def add(self, reference, prediction):
+        """Accumulate one file. Both sequences must already be collapsed."""
+        for ref, hyp in align_phones(reference, prediction):
+            key = (
+                INSERTION if ref is None else ref,
+                DELETION if hyp is None else hyp,
+            )
+            self.counts[key] = self.counts.get(key, 0) + 1
+
+    @property
+    def errors(self):
+        return sum(n for (ref, hyp), n in self.counts.items() if ref != hyp)
+
+    @property
+    def total(self):
+        """Lab phonemes counted, matches included."""
+        return sum(n for (ref, _), n in self.counts.items() if ref != INSERTION)
+
+    def row_totals(self):
+        totals = {}
+        for (ref, _), n in self.counts.items():
+            totals[ref] = totals.get(ref, 0) + n
+        return totals
+
+    def column_totals(self):
+        totals = {}
+        for (_, hyp), n in self.counts.items():
+            totals[hyp] = totals.get(hyp, 0) + n
+        return totals
+
+    def rows(self):
+        return _ranked_labels(self.row_totals())
+
+    def columns(self):
+        return _ranked_labels(self.column_totals())
+
+    def matrix(self, rows=None, columns=None):
+        """Counts as a (rows, columns) array, in the given label order."""
+        rows = self.rows() if rows is None else list(rows)
+        columns = self.columns() if columns is None else list(columns)
+        row_at = {label: i for i, label in enumerate(rows)}
+        col_at = {label: j for j, label in enumerate(columns)}
+        out = np.zeros((len(rows), len(columns)), dtype=np.int64)
+        for (ref, hyp), n in self.counts.items():
+            i, j = row_at.get(ref), col_at.get(hyp)
+            if i is not None and j is not None:
+                out[i, j] += n
+        return out
+
+    def top_confusions(self, k=3, min_count=1):
+        """Worst off-diagonal cells as (count, lab, decoded, % of that lab phone).
+
+        Sorted by how often the mistake happens, which is not the same as by
+        percentage: a rare phone confused 100% of the time is one count here.
+        """
+        totals = self.row_totals()
+        ranked = sorted(
+            (
+                (n, ref, hyp, 100.0 * n / totals[ref])
+                for (ref, hyp), n in self.counts.items()
+                if ref != hyp and n >= min_count
+            ),
+            key=lambda item: (-item[0], item[1], item[2]),
+        )
+        return ranked[:k] if k else ranked
+
+    def to_text(self, k=10, min_count=1):
+        ranked = self.top_confusions(k, min_count)
+        lines = [
+            f"{len(ranked)} lab->decoded confusions out of {self.errors} errors"
+            f" / {self.total} lab phonemes",
+            *(f"{ref} -> {hyp}: {n} ({pct:.0f}% of {ref})" for n, ref, hyp, pct in ranked),
+        ]
+        if not ranked:
+            lines.append("none above the min_count threshold")
+        return "\n".join(lines)
+
+    def save_csv(self, path):
+        """Full matrix as counts. Row 1 is the header: `lab\\decoded`."""
+        rows, columns = self.rows(), self.columns()
+        if not rows or not columns:
+            return
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["lab\\decoded"] + columns)
+            for label, values in zip(rows, self.matrix(rows, columns)):
+                writer.writerow([label] + [int(v) for v in values])
+
+
 def boundary_counts(ref_segments, hyp_segments, tolerances_ms):
     """Raw boundary counts for one file, ready to be summed over a set.
 
@@ -326,6 +497,106 @@ def forced_align_bio(
             k = s - ((N + 1) + N)
             tags.append(f"I-{phones[k]}")
     return tags
+
+
+# One colour per error kind, so a missed phone reads differently from a phone
+# decoded as its neighbour without having to decode the label.
+ERROR_KINDS = {
+    "substitution": "#4C72B0",
+    "deletion": "#DD8452",
+    "insertion": "#C44E52",
+}
+
+# The colour key goes in the title rather than in a legend box: on a chart whose
+# bars start at the left edge there is no corner a legend can sit in without
+# covering a bar, and the worst bars are the ones worth looking at.
+ERROR_KIND_HINTS = {
+    "substitution": "blue = decoded as another phoneme",
+    "deletion": "orange = <del>, never decoded",
+    "insertion": "red = <ins>, decoded out of nothing",
+}
+
+
+def error_kind(lab, decoded):
+    if lab == INSERTION:
+        return "insertion"
+    return "deletion" if decoded == DELETION else "substitution"
+
+
+def plot_phone_confusion(confusion, *, top_k=25, min_count=1, normalize=True, title=None):
+    """Bar chart of the worst lab -> decoded confusions, worst on top.
+
+    One bar per confused pair, labelled on the left as `s->SH`, `s-><del>` or
+    `<ins>->s`, with the count along the axis below. Ranking by bar length
+    answers "what do I fix first" in one look: a phoneme wrong 400 times costs
+    far more PER than one wrong twice, and a heatmap of percentages would rank
+    the rare broken phoneme above it. With `normalize` each bar also carries the
+    share of that lab phoneme, which is what separates "this phone is rare and
+    messy" from "this phone is broken".
+
+    Pairs below `min_count` are dropped and the `top_k` worst are kept; the full
+    untruncated counts are in the CSV, not here.
+    """
+    ranked = confusion.top_confusions(top_k, min_count)
+
+    fig, ax = plt.subplots(figsize=(10.0, 0.34 * len(ranked) + 1.8))
+    if not ranked:
+        ax.text(
+            0.5, 0.5, "no confusions above the threshold", ha="center",
+            va="center", transform=ax.transAxes,
+        )
+        ax.set_axis_off()
+        ax.set_title(_confusion_title(confusion, title), fontsize=10)
+        return fig
+
+    counts = [n for n, *_ in ranked]
+    labels = [f"{ref}->{hyp}" for _, ref, hyp, _ in ranked]
+    colours = [ERROR_KINDS[error_kind(ref, hyp)] for _, ref, hyp, _ in ranked]
+
+    # barh draws the first row at the bottom; invert so the worst is on top.
+    positions = np.arange(len(ranked))
+    ax.barh(positions, counts, color=colours, height=0.68)
+    ax.set_yticks(positions)
+    ax.set_yticklabels(labels, fontsize=9, fontfamily="monospace")
+    ax.invert_yaxis()
+
+    longest = max(counts)
+    ax.set_xlim(0, longest * 1.16)  # room for the value at the end of the bar
+    ax.set_xlabel(
+        "count" if not normalize
+        else "count   --   trailing % is the share of that lab phoneme",
+        fontsize=9,
+    )
+    ax.xaxis.grid(True, alpha=0.25, linewidth=0.6)
+    ax.set_axisbelow(True)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    for i, (n, _, _, pct) in enumerate(ranked):
+        text = f"{n}  {pct:.0f}%" if normalize else str(n)
+        ax.text(
+            n + longest * 0.015, i, text, va="center", ha="left", fontsize=8,
+            color="black",
+        )
+
+    kinds = {error_kind(ref, hyp) for _, ref, hyp, _ in ranked}
+    heading = _confusion_title(confusion, title)
+    if len(kinds) > 1:
+        heading += "\n" + "   ".join(
+            ERROR_KIND_HINTS[kind] for kind in ERROR_KINDS if kind in kinds
+        )
+    ax.set_title(heading, fontsize=10)
+    fig.tight_layout()
+    return fig
+
+
+def _confusion_title(confusion, title=None):
+    if title is not None:
+        return title
+    return (
+        f"lab -> decoded: {confusion.errors} errors / {confusion.total} "
+        f"lab phonemes"
+    )
 
 
 def visualize_prediction(wav, sr, pred, gt=None):

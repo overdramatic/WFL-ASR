@@ -96,3 +96,14 @@ validation:
   # headline number; 20 ms is the frame grid, so anything at or below it means
   # "on the right frame".
   boundary_tolerance_ms: [20, 40]
+
+  # Which phoneme the model actually gets wrong, aligned against the original
+  # .lab like PER is. Logged as a figure (val/confusion_matrix) and a text
+  # summary (val/confusion_top), with the counts in <save_dir>/confusion_matrix.csv.
+  confusion_matrix:
+    enabled: true
+    top_k: 25          # worst lab->decoded pairs to plot, one bar each
+    min_count: 1       # drop pairs below this count, so coincidences stay quiet
+    normalize: true    # label each bar with the % of that lab phoneme too
+    console_top: 3     # worst pairs appended to the VALID line
+    csv: true          # write the raw counts to <save_dir>/confusion_matrix.csv

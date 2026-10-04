@@ -22,11 +22,13 @@ from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from torch.utils.data import Dataset, DataLoader, Subset, random_split
 from model import BIOPhonemeTagger, FocalLoss
 from utils import (
+    PhoneConfusionMatrix,
     boundary_counts,
     collapse_repeated,
     decode_bio_tags,
     load_phoneme_list,
     phone_error_rate,
+    plot_phone_confusion,
     visualize_prediction,
 )
 import pytorch_optimizer as optim
@@ -336,6 +338,22 @@ class WFLModel(pl.LightningModule):
         )
         self.primary_tolerance_ms = self.boundary_tolerances_ms[-1]
 
+        # PER counts the phonemes the model gets wrong but not which ones, and
+        # that is the only question left once the rate is high: a flat 15% can be
+        # one phoneme collapsing onto its neighbour or fifteen phones sharing it.
+        # The confusion matrix is accumulated over the same decoded sequences
+        # PER is measured on, so the two always agree.
+        cm_cfg = config.get("validation", {}).get("confusion_matrix", {}) or {}
+        self.cm_enabled = cm_cfg.get("enabled", True)
+        self.cm_top_k = int(cm_cfg.get("top_k", 25))
+        self.cm_min_count = int(cm_cfg.get("min_count", 1))
+        self.cm_normalize = cm_cfg.get("normalize", True)
+        self.cm_console_top = int(cm_cfg.get("console_top", 3))
+        self.cm_csv = cm_cfg.get("csv", True)
+        self.cm_dir = config["output"]["save_dir"]
+        # Rebuilt per validation pass in on_validation_epoch_start.
+        self._confusion = PhoneConfusionMatrix()
+
         total_val = config["data"]["num_val_files"]
         self.num_vis_samples = min(total_val, 8)
 
@@ -496,6 +514,7 @@ class WFLModel(pl.LightningModule):
 
     def on_validation_epoch_start(self):
         self.val_vis_count = 0
+        self._confusion = PhoneConfusionMatrix()
         try:
             self._val_batches = len(self.trainer.val_dataloaders[0])
         except (TypeError, IndexError, RuntimeError):
@@ -569,6 +588,11 @@ class WFLModel(pl.LightningModule):
                 errors_i, ref_n = phone_error_rate(reference, prediction)
                 errors += errors_i
                 phone_count += ref_n
+                if self.cm_enabled:
+                    # Only scored files, for the same reason PER skips the rest:
+                    # a file with no lab phonemes has nothing to be confused
+                    # with, and its predictions would inflate the insertions.
+                    self._confusion.add(reference, prediction)
             else:
                 files_empty += 1
 
@@ -637,7 +661,66 @@ class WFLModel(pl.LightningModule):
             # train/loss_epoch is not reduced yet -- on_epoch metrics land after
             # this hook -- so the step EMA is the only current figure available.
             f"  | trn {self._loss_ema if self._loss_ema is not None else float('nan'):7.4f}"
+            # Which phonemes, not just how many: the first pairs are the ones
+            # worth fixing. The full matrix goes to TensorBoard.
+            f"{self._confusion_note()}"
         )
+        self._log_confusion()
+
+    def _confusion_note(self):
+        """Worst lab->decoded pairs as a suffix for the VALID line ('' if none).
+
+        `s->SH 12` is a lab phoneme decoded as another one; `s-><del>` was never
+        decoded and `<ins>->s` was decoded without the lab asking for it.
+        """
+        if not self.cm_enabled:
+            return ""
+        pairs = self._confusion.top_confusions(self.cm_console_top)
+        if not pairs:
+            return ""
+        return "  conf " + " ".join(
+            f"{ref}->{hyp} {n}" for n, ref, hyp, _ in pairs
+        )
+
+    def _log_confusion(self):
+        """Confusion matrix to TensorBoard, plus raw counts on disk.
+
+        Figure and text carry the history epoch by epoch; the CSV is overwritten
+        each pass, so it always describes the model as of the last validation --
+        the sanity check writes the untrained baseline first.
+        """
+        if not self.cm_enabled or not self._confusion.counts:
+            return
+
+        if self.cm_csv:
+            try:
+                self._confusion.save_csv(
+                    os.path.join(self.cm_dir, "confusion_matrix.csv")
+                )
+            except OSError as exc:
+                self.status.line(f"[!] could not write confusion_matrix.csv: {exc}")
+
+        if not self.logger:
+            return
+        try:
+            self.logger.experiment.add_text(
+                "val/confusion_top", self._confusion.to_text(),
+                global_step=self.global_step,
+            )
+            fig = plot_phone_confusion(
+                self._confusion,
+                top_k=self.cm_top_k,
+                min_count=self.cm_min_count,
+                normalize=self.cm_normalize,
+            )
+            try:
+                self.logger.experiment.add_figure(
+                    "val/confusion_matrix", fig, global_step=self.global_step,
+                )
+            finally:
+                plt.close(fig)
+        except Exception as exc:  # a plot must not take the epoch down with it
+            self.status.line(f"[!] confusion matrix not logged: {exc}")
 
     def _log_visualization(self, wav, pred_segments, gt_segments, sample_idx=0):
         fig = visualize_prediction(wav, 16000, pred_segments, gt_segments)
