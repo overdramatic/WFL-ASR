@@ -63,6 +63,10 @@ training:
   lr_decay_every_n_epochs: 5
   lr_decay_gamma: 0.95
 
+  precision: "16-mixed"
+
+  accumulate_grad_batches: 1
+
   max_checkpoints: 5
   log_dir: "logs/high"
   merged_phoneme_groups: []
